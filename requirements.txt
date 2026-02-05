@@ -2,3 +2,6 @@ discord.py
 yt-dlp
 PyNaCl
 flask
+ffmpeg-python
+imageio-ffmpeg
+
