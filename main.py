@@ -5,136 +5,152 @@ import yt_dlp
 import asyncio
 import os
 
-# ===== KEEP ALIVE (HOSTING) =====
+# ===== FFmpeg portable =====
+import imageio_ffmpeg
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+
+# ===== Flask keep alive =====
 from flask import Flask
 from threading import Thread
 
-app = Flask("")
+app = Flask('')
 
-@app.route("/")
+@app.route('/')
 def home():
     return "Bot is alive!"
 
 def run_web():
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=8080)
 
-def keep_alive():
-    t = Thread(target=run_web)
-    t.start()
+Thread(target=run_web).start()
 
-# ===============================
 
-TOKEN = os.getenv("TOKEN")
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.voice_states = True
-
+# ===== Discord Setup =====
+intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== MUSIC STORAGE =====
+# ===== Queue =====
 queues = {}
 
-# ===== YTDLP CONFIG =====
-ytdlp_format_options = {
-    "format": "bestaudio/best",
-    "quiet": True
+def get_queue(guild_id):
+    if guild_id not in queues:
+        queues[guild_id] = []
+    return queues[guild_id]
+
+
+# ===== YT-DLP =====
+ydl_opts = {
+    'format': 'bestaudio',
+    'noplaylist': True,
+    'quiet': True
 }
 
-ffmpeg_options = {
-    "options": "-vn"
-}
 
-ytdl = yt_dlp.YoutubeDL(ytdlp_format_options)
-
-# ===== GET AUDIO =====
-async def get_audio(url):
+async def get_audio_url(query):
     loop = asyncio.get_event_loop()
-    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-    
-    if "entries" in data:
-        data = data["entries"][0]
 
-    return data["url"], data["title"]
+    def extract():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
 
-# ===== JOIN VOICE =====
+            if "entries" in info:
+                info = info["entries"][0]
+
+            return info["url"], info["title"]
+
+    return await loop.run_in_executor(None, extract)
+
+
+# ===== Voice =====
 async def ensure_voice(interaction):
-    if not interaction.user.voice:
-        await interaction.response.send_message("❌ Bạn phải vào voice trước", ephemeral=True)
+    if interaction.user.voice is None:
+        await interaction.response.send_message("Bạn chưa vào voice!", ephemeral=True)
         return None
 
     channel = interaction.user.voice.channel
+    vc = interaction.guild.voice_client
 
-    if interaction.guild.voice_client:
-        return interaction.guild.voice_client
-    else:
-        return await channel.connect()
+    if vc is None:
+        vc = await channel.connect()
+    elif vc.channel != channel:
+        await vc.move_to(channel)
 
-# ===== PLAY NEXT =====
+    return vc
+
+
 async def play_next(guild):
-    if guild.id not in queues or len(queues[guild.id]) == 0:
+    queue = get_queue(guild.id)
+
+    if not queue:
         return
 
     vc = guild.voice_client
-    url = queues[guild.id].pop(0)
 
-    stream_url, title = await get_audio(url)
+    url, title = queue.pop(0)
 
-    source = discord.FFmpegPCMAudio(stream_url, **ffmpeg_options)
+    source = discord.FFmpegPCMAudio(
+        url,
+        executable=FFMPEG_PATH,
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        options="-vn"
+    )
 
-    def after_play(err):
-        fut = play_next(guild)
-        asyncio.run_coroutine_threadsafe(fut, bot.loop)
+    def after(err):
+        asyncio.run_coroutine_threadsafe(play_next(guild), bot.loop)
 
-    vc.play(source, after=after_play)
+    vc.play(source, after=after)
 
-# ===== EVENTS =====
+
+# ===== Events =====
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print(f"Logged in as {bot.user}")
 
-# ===== SLASH COMMANDS =====
 
-@bot.tree.command(name="play", description="Phát nhạc từ YouTube")
-async def play(interaction: discord.Interaction, url: str):
+# ===== Slash Commands =====
+@bot.tree.command(name="play", description="Phát nhạc")
+async def play(interaction: discord.Interaction, query: str):
 
     vc = await ensure_voice(interaction)
-    if not vc:
+    if vc is None:
         return
 
-    if interaction.guild.id not in queues:
-        queues[interaction.guild.id] = []
+    await interaction.response.send_message("Đang tìm nhạc...")
 
-    queues[interaction.guild.id].append(url)
+    url, title = await get_audio_url(query)
 
-    await interaction.response.send_message(f"🎵 Đã thêm vào queue")
+    queue = get_queue(interaction.guild.id)
+    queue.append((url, title))
 
     if not vc.is_playing():
         await play_next(interaction.guild)
 
-# =====================
+    await interaction.followup.send(f"🎵 Đã thêm: {title}")
 
-@bot.tree.command(name="skip", description="Bỏ bài hiện tại")
+
+@bot.tree.command(name="skip")
 async def skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
+
     if vc and vc.is_playing():
         vc.stop()
-        await interaction.response.send_message("⏭ Đã skip")
+        await interaction.response.send_message("⏭️ Skip")
     else:
-        await interaction.response.send_message("❌ Không có nhạc")
+        await interaction.response.send_message("Không có nhạc")
 
-# =====================
 
-@bot.tree.command(name="stop", description="Dừng và rời voice")
-async def stop(interaction: discord.Interaction):
+@bot.tree.command(name="leave")
+async def leave(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
+
     if vc:
-        queues[interaction.guild.id] = []
         await vc.disconnect()
-        await interaction.response.send_message("🛑 Đã dừng bot")
+        await interaction.response.send_message("👋 Rời voice")
+    else:
+        await interaction.response.send_message("Bot chưa vào voice")
 
-# =====================
 
-keep_alive()
+# ===== RUN BOT =====
+TOKEN = os.getenv("TOKEN")
 bot.run(TOKEN)
